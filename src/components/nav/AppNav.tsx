@@ -6,6 +6,7 @@ import { MoreMenu } from './MoreMenu';
 
 const desktopItems = [
   { to: '/', label: 'Home', exact: true },
+  { to: '/about', label: 'About', exact: false },
   { to: '/check-fare', label: 'Check My Fare', exact: false },
   { to: '/routes', label: 'Find My Route', exact: false },
   { to: '/discounts', label: 'Discounts', exact: false },
@@ -78,9 +79,9 @@ export function DesktopNavigation() {
         </Link>
 
         <LayoutGroup id="desktop-nav">
-          <nav className="flex min-w-0 flex-1 items-center justify-end gap-0.5" aria-label="Main navigation">
+          <nav className="flex min-w-0 flex-1 items-center justify-start gap-0.5 overflow-x-auto scrollbar-hide pb-1" aria-label="Main navigation" style={{ scrollbarGutter: 'stable' }}>
             {desktopItems.map(({ to, label, exact }) => (
-              <NavLink key={to} to={to} end={exact} className="group relative rounded-xl px-2.5 py-2 text-[13px] font-medium whitespace-nowrap">
+              <NavLink key={to} to={to} end={exact} className="group relative rounded-xl px-3 py-2 text-[13px] font-medium whitespace-nowrap flex-shrink-0">
                 {({ isActive }) => (
                   <>
                     {isActive && (

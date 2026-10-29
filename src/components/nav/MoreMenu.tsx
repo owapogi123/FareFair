@@ -1,5 +1,5 @@
 import { NavLink } from 'react-router-dom';
-import { X, Home, Calculator, Map, Tag, MapPinned, AlertOctagon, BookOpen, HelpCircle } from 'lucide-react';
+import { X, Home, Info, Calculator, Map, Tag, MapPinned, AlertOctagon, BookOpen, HelpCircle } from 'lucide-react';
 import { useEffect } from 'react';
 import { AnimatePresence, motion } from 'framer-motion';
 
@@ -11,6 +11,7 @@ interface MoreMenuProps {
 
 const items = [
   { to: '/', label: 'Home', description: 'FareFair overview', icon: Home },
+  { to: '/about', label: 'About', description: 'Our mission & team', icon: Info },
   { to: '/check-fare', label: 'Check My Fare', description: 'Compare what you paid', icon: Calculator },
   { to: '/routes', label: 'Find My Route', description: 'Search verified routes', icon: Map },
   { to: '/discounts', label: 'Discounts', description: 'Student, Senior, PWD', icon: Tag },
