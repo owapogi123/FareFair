@@ -237,7 +237,8 @@ WITH CHECK (true);
 -- SECTION 9: OVERCHARGE REPORTS — SECURE ANONYMOUS SUBMISSION, CONTROLLED STATUS
 -- ============================================================================
 
--- Add column to track anonymous submissions (non-breaking, default false)
+-- Add column to track anonymous submissions (set by BEFORE INSERT trigger)
+-- Default retained for safety; trigger overrides for client inserts.
 ALTER TABLE public.overcharge_reports
 ADD COLUMN IF NOT EXISTS submitted_by_anon boolean NOT NULL DEFAULT false;
 
@@ -273,7 +274,12 @@ GRANT SELECT ON public.fare_rules TO anon;
 GRANT SELECT ON public.fare_matrices TO anon;
 GRANT SELECT ON public.routes TO anon;
 GRANT SELECT ON public.tourism_prices TO anon;
-GRANT INSERT ON public.overcharge_reports TO anon;
+-- Column-level INSERT: only client-settable fields. Server-controlled fields
+-- (id, user_id, submitted_by_anon, submitter_ip_hash, status, created_at) are EXCLUDED.
+GRANT INSERT (transport_type_id, origin_location_id, destination_location_id,
+              origin_text, destination_text, expected_fare, charged_fare,
+              difference, vehicle_plate, operator, driver_details, notes, occurred_at)
+ON public.overcharge_reports TO anon;
 -- NO GRANT UPDATE ON overcharge_reports TO anon (anon cannot update reports)
 -- NO GRANT INSERT ON evidence_files TO anon (server-mediated via Edge Function)
 
@@ -286,7 +292,11 @@ GRANT SELECT ON public.fare_rules TO authenticated;
 GRANT SELECT ON public.fare_matrices TO authenticated;
 GRANT SELECT ON public.routes TO authenticated;
 GRANT SELECT ON public.tourism_prices TO authenticated;
-GRANT INSERT ON public.overcharge_reports TO authenticated;
+-- Column-level INSERT: same client-settable fields. user_id is EXCLUDED (set by trigger).
+GRANT INSERT (transport_type_id, origin_location_id, destination_location_id,
+              origin_text, destination_text, expected_fare, charged_fare,
+              difference, vehicle_plate, operator, driver_details, notes, occurred_at)
+ON public.overcharge_reports TO authenticated;
 GRANT SELECT ON public.overcharge_reports TO authenticated;
 GRANT SELECT ON public.evidence_files TO authenticated;
 -- NO GRANT INSERT ON evidence_files TO authenticated (server-mediated via Edge Function)
@@ -313,33 +323,81 @@ GRANT ALL ON public.transport_types TO service_role;
 GRANT ALL ON public.locations TO service_role;
 GRANT ALL ON public.discount_types TO service_role;
 
+-- BEFORE INSERT trigger: set server-controlled fields for anon and authenticated.
+-- This replaces reliance on column defaults or client-provided values.
+-- SECURITY DEFINER with minimal search_path; all external calls are schema-qualified.
+CREATE OR REPLACE FUNCTION public.set_overcharge_report_server_fields()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+AS $$
+DECLARE
+  caller_role text := auth.role();
+BEGIN
+  -- id is auto-generated (gen_random_uuid), nothing to do
+
+  -- service_role (Edge Functions) sets all fields explicitly; do not override.
+  IF caller_role = 'service_role' THEN
+    RETURN NEW;
+  END IF;
+
+  -- user_id & submitted_by_anon: derive from caller's auth role
+  IF caller_role = 'anon' THEN
+    NEW.user_id := NULL;
+    NEW.submitted_by_anon := true;
+  ELSIF caller_role = 'authenticated' THEN
+    -- Require a valid JWT subject
+    IF auth.uid() IS NULL THEN
+      RAISE EXCEPTION 'overcharge_reports: authenticated caller missing uid'
+        USING ERRCODE = 'insufficient_privilege';
+    END IF;
+    NEW.user_id := auth.uid();
+    NEW.submitted_by_anon := false;
+  ELSE
+    -- Reject any unexpected context for direct client inserts.
+    RAISE EXCEPTION 'overcharge_reports: direct INSERT not allowed for role %', caller_role
+      USING ERRCODE = 'insufficient_privilege';
+  END IF;
+
+  -- status: always 'pending' on client insert
+  NEW.status := 'pending';
+
+  -- submitter_ip_hash: NULL for client inserts (Edge Function sets it via service_role)
+  NEW.submitter_ip_hash := NULL;
+
+  -- created_at: server timestamp (overrides any client attempt)
+  NEW.created_at := pg_catalog.now();
+
+  RETURN NEW;
+END;
+$$;
+
+-- No EXECUTE grants needed: trigger mechanism invokes SECURITY DEFINER function
+-- regardless of caller permissions. Revoking from PUBLIC prevents direct calls.
+REVOKE EXECUTE ON FUNCTION public.set_overcharge_report_server_fields() FROM PUBLIC;
+
+DROP TRIGGER IF EXISTS overcharge_reports_set_server_fields ON public.overcharge_reports;
+CREATE TRIGGER overcharge_reports_set_server_fields
+BEFORE INSERT ON public.overcharge_reports
+FOR EACH ROW
+EXECUTE FUNCTION public.set_overcharge_report_server_fields();
+
 -- Anonymous INSERT (role=anon):
---   - user_id MUST be NULL
---   - submitted_by_anon MUST be true
---   - status MUST be 'pending'
+-- Column-level GRANT already prevents setting protected fields.
+-- RLS policy enforces: current_user = 'anon' (defense in depth).
 CREATE POLICY "overcharge_reports_anon_insert"
 ON public.overcharge_reports FOR INSERT
 TO anon
-WITH CHECK (
-    current_user = 'anon'
-    AND user_id IS NULL
-    AND submitted_by_anon = true
-    AND status = 'pending'
-);
+WITH CHECK (current_user = 'anon');
 
 -- Authenticated INSERT (role=authenticated):
---   - user_id MUST match auth.uid()
---   - submitted_by_anon MUST be false
---   - status MUST be 'pending'
+-- Column-level GRANT already prevents setting protected fields.
+-- RLS policy enforces: current_user = 'authenticated' (defense in depth).
 CREATE POLICY "overcharge_reports_authenticated_insert"
 ON public.overcharge_reports FOR INSERT
 TO authenticated
-WITH CHECK (
-    current_user = 'authenticated'
-    AND user_id = auth.uid()
-    AND submitted_by_anon = false
-    AND status = 'pending'
-);
+WITH CHECK (current_user = 'authenticated');
 
 -- Authenticated users read ONLY their own reports (user_id = auth.uid())
 -- Anon users have NO SELECT policy (cannot read any reports)
@@ -380,14 +438,31 @@ WITH CHECK (
 
 -- CRITICAL: Evidence upload is mediated by a Supabase Edge Function.
 -- Database policies here are DEFENSE-IN-DEPTH only.
--- The Edge Function:
+-- The Edge Function (running as service_role):
 --   1. Verifies the report exists and ownership matches the caller
+--      - For authenticated reports: report.user_id = auth.uid()
+--      - For anonymous reports: report.submitted_by_anon = true AND a
+--        one-time upload token (issued at report creation) is presented
 --   2. Generates an unguessable, time-limited Storage path (signed URL)
+--      in a PRIVATE Storage bucket (not public)
 --   3. Inserts the evidence_files row with verified report_id
--- Direct database INSERT by clients is DENIED.
+-- Direct database INSERT/UPDATE/DELETE by anon or authenticated clients is DENIED.
+-- No GRANT INSERT/UPDATE/DELETE on evidence_files to anon or authenticated.
 
--- NO INSERT policy for anon or authenticated roles.
--- Only service_role and staff (via Edge Function using service_role key) can INSERT.
+-- MISSING IMPLEMENTATION (outside this migration):
+--   * Private Storage bucket 'evidence' with RLS policies allowing only
+--     service_role (Edge Function) to write; signed URLs for client upload.
+--   * Edge Function 'upload-evidence' that:
+--       - Accepts report_id + optional upload_token (for anon reports)
+--       - Validates ownership as above
+--       - Enforces file-size limit (e.g., 5 MB) and allowed MIME types
+--       - Issues signed upload URL, then inserts evidence_files row
+--   * Report creation Edge Function (or DB trigger) that issues a
+--     one-time upload_token for anonymous reports and returns it to the
+--     client so they can later upload evidence without a user_id.
+
+-- NO INSERT/UPDATE/DELETE policy for anon or authenticated roles.
+-- Only service_role (Edge Function) can modify evidence_files.
 
 CREATE POLICY "evidence_files_service_all"
 ON public.evidence_files FOR ALL
@@ -395,7 +470,7 @@ TO service_role
 USING (true)
 WITH CHECK (true);
 
--- Staff can SELECT all evidence for review
+-- Staff can SELECT all evidence for review (server-controlled app_metadata claim)
 CREATE POLICY "evidence_files_staff_select"
 ON public.evidence_files FOR SELECT
 TO authenticated
@@ -404,7 +479,7 @@ USING (
     OR (current_setting('request.jwt.claims', true)::jsonb ->> 'role') = 'service_role'
 );
 
--- Authenticated users can SELECT evidence for their own reports (defense-in-depth)
+-- Authenticated users can SELECT evidence only for their own reports
 CREATE POLICY "evidence_files_auth_read_own"
 ON public.evidence_files FOR SELECT
 TO authenticated
@@ -416,22 +491,29 @@ USING (
     )
 );
 
+-- Anonymous users have NO SELECT policy on evidence_files.
+-- Access to evidence for anonymous reports is ONLY via the Edge Function
+-- using the one-time upload_token; this prevents any anonymous user from
+-- enumerating or reading other anonymous reports' evidence.
+
 -- ============================================================================
 -- SECTION 12: STAFF STATUS-UPDATE WORKFLOW (REQUIRES SERVER-SIDE IMPLEMENTATION)
 -- ============================================================================
 -- The column-level GRANT and RLS policy "overcharge_reports_auth_update_own_fields"
 -- allow authenticated users to update only non-sensitive fields on their own reports.
--- Staff (app_metadata.claims.staff = true) have full access via "overcharge_reports_staff_all"
--- including status transitions (pending → resolved/dismissed).
+-- Staff (app_metadata.claims.staff = true) have full *row-level* access via
+-- "overcharge_reports_staff_all" (they can read/write any row), but column-level
+-- UPDATE grants for the authenticated role still exclude protected columns
+-- (status, submitted_by_anon, user_id, submitter_ip_hash, created_at).
+-- Therefore a staff JWT claim does NOT override column-level UPDATE permissions.
 --
--- SECURITY NOTE: Status transitions by staff MUST go through a secure server-side workflow
+-- SECURITY NOTE: Status transitions MUST go through a secure server-side workflow
 -- (e.g., Supabase Edge Function using service_role) that:
---   1. Verifies the caller has valid staff claim
+--   1. Verifies the caller has a valid staff claim
 --   2. Logs the status change with timestamp and staff identity
 --   3. Enforces business rules (e.g., cannot reopen dismissed reports)
--- Direct client UPDATE of status by staff is NOT prevented by column-level grants
--- (staff has service_role GRANT ALL), so the application layer must enforce
--- the workflow. This is documented here for implementation outside this migration.
+-- Direct client UPDATE of status by staff is prevented by column-level grants;
+-- only service_role (or a privileged server function) can modify protected columns.
 
 -- ============================================================================
 -- SECTION 13: VALIDATION QUERIES (run after migration to verify)
@@ -446,8 +528,9 @@ USING (
 -- Verify conflicting_data tourism prices are hidden from public (should return 0 for anon)
 -- SELECT count(*) FROM public.tourism_prices WHERE verification_status = 'conflicting_data';
 
--- Verify overcharge_reports: anon can insert with user_id=NULL, submitted_by_anon=true, status=pending
--- INSERT INTO public.overcharge_reports (transport_type_id, charged_fare, occurred_at, user_id, submitted_by_anon, status) VALUES ((SELECT id FROM public.transport_types LIMIT 1), 50.00, now(), NULL, true, 'pending');
+-- Verify overcharge_reports: anon can insert with only client-settable fields
+-- Trigger sets user_id=NULL, submitted_by_anon=true, status='pending', submitter_ip_hash=NULL, created_at=now()
+-- INSERT INTO public.overcharge_reports (transport_type_id, charged_fare, occurred_at) VALUES ((SELECT id FROM public.transport_types LIMIT 1), 50.00, now());
 
 -- Verify evidence_files: direct INSERT denied for anon/authenticated
 -- INSERT INTO public.evidence_files (report_id, storage_path, file_name) VALUES ('00000000-0000-0000-0000-000000000000', 'test', 'test.jpg'); -- should fail
