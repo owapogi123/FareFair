@@ -8,6 +8,7 @@ import { Footer } from './components/layout/Footer';
 import { supabase } from './lib/supabase';
 
 const HomePage = lazy(() => import('./pages/HomePage').then((m) => ({ default: m.HomePage })));
+const AboutPage = lazy(() => import('./pages/AboutPage').then((m) => ({ default: m.AboutPage })));
 const CheckFarePage = lazy(() => import('./pages/CheckFarePage').then((m) => ({ default: m.CheckFarePage })));
 const RoutesPage = lazy(() => import('./pages/RoutesPage').then((m) => ({ default: m.RoutesPage })));
 const DiscountsPage = lazy(() => import('./pages/DiscountsPage').then((m) => ({ default: m.DiscountsPage })));
@@ -52,6 +53,7 @@ function AnimatedRoutes() {
         <ScrollToTop />
         <Routes location={location} key={location.pathname}>
           <Route path="/" element={<HomePage />} />
+          <Route path="/about" element={<AboutPage />} />
           <Route path="/check-fare" element={<CheckFarePage />} />
           <Route path="/routes" element={<RoutesPage />} />
           <Route path="/discounts" element={<DiscountsPage />} />
